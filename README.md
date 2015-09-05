@@ -438,7 +438,8 @@ few:
   recommended to fall back to core dumps and gdb in this case.
 * If the monitored executable does not terminate regularly and/or doesn't
   call the regular exit handlers, louse will not report anything at 
-  shutdown. 
+  shutdown. Especially, louse will not report memleaks if the monitored
+  program exists via `::_exit()`, `std::abort()` or crashes. 
 * Only calls to `malloc`, `calloc`, `realloc`, `new` and `new[]` are
   intercepted. Executables that allocate memory via `brk`, `sbrk`, 
   `posix_memalign`, `aligned_alloc` or other means cannot be monitored with
@@ -450,5 +451,7 @@ few:
   `--suppress` is used and some memory leaks are filtered away, louse will 
   still need to resolve the stacktrace to check if the output must be 
   filtered.
-* repeated memory leaks from the same call site are not aggregated but are
-  reported independently. 
+* Repeated memory leaks from the same call site are not aggregated by 
+  louse but are reported independently. 
+* Memleaks from libraries will be treated as regular memleaks. To suppress
+  them, they need to filtered out explicitly using the `--suppress` option.
