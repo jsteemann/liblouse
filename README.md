@@ -307,7 +307,7 @@ If the buffer overrun is more drastic and longer than the length of the tail
 signature that is added to allocated memory blocks by louse, the executable
 will likely crash, and louse will not have a chance to report issues.
 Changing this would require tracking **all** memory accesses by the program,
-which far beyond the scope of louse. Use [Valgrind](http://valgrind.org) for that!
+which is far beyond the scope of louse. Use [Valgrind](http://valgrind.org) for that!
 
 ### Finding memory leaks
 
@@ -379,7 +379,7 @@ check error: leak of size 1024 byte(s), allocated with via malloc():
   # ERR_load_crypto_strings (??:?)
   # SSL_load_error_strings (??:?)
 ```
-you could use `--suppress "(CRYPTO_malloc|SSL_load_error_strings)" when
+you could use `--suppress "(CRYPTO_malloc|SSL_load_error_strings)"` when
 invoking louse.
 
 
