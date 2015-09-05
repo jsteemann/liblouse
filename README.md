@@ -157,7 +157,8 @@ louse provides the following options:
   the executable to terminate regularly and call exit handlers)
 * `--with-traces`: capture stack traces for all memory allocations. 
   This has notable runtime overhead, but is required for retrieving 
-  meaningful output in case of errors
+  meaningful output in case of errors. Turning off stack traces will 
+  make louse run much faster and greatly reduce its shutdown time.
 * `--frames`: maximum number of stack frames to capture. Adjusting this
   value will have an effect on the memory consumption required for
   keeping stackfraces, and for the time required to produce them and
@@ -437,8 +438,17 @@ few:
   recommended to fall back to core dumps and gdb in this case.
 * If the monitored executable does not terminate regularly and/or doesn't
   call the regular exit handlers, louse will not report anything at 
-  shutdown.
+  shutdown. 
 * Only calls to `malloc`, `calloc`, `realloc`, `new` and `new[]` are
   intercepted. Executables that allocate memory via `brk`, `sbrk`, 
   `posix_memalign`, `aligned_alloc` or other means cannot be monitored with
   louse. `mmap` and `munmap` are not intercepted by louse either.
+* On shutdown, louse will call `addr2line` to turn the stacktrace 
+  addresses into human-readable output. It will repeatedly fork and call
+  `addr2line` (once per line in each stack trace). This may make shutdown
+  extremely slow if there are lots of memory leaks. Note that even if
+  `--suppress` is used and some memory leaks are filtered away, louse will 
+  still need to resolve the stacktrace to check if the output must be 
+  filtered.
+* repeated memory leaks from the same call site are not aggregated but are
+  reported independently. 
