@@ -1,0 +1,60 @@
+#!/bin/bash
+
+if [ ! -e /usr/bin/addr2line ]; then
+  echo "required /usr/bin/addr2line is not present"
+  exit 1
+fi
+
+LOUSE_FILTER=""
+LOUSE_WITHLEAKS="yes"
+
+function usage()
+{
+  echo "$0 [arguments] program [program-arguments]"
+  echo "  --suppress      regular expression for leak suppression"
+  echo "  --with-leaks    turn leak checking on or off"
+  echo "  --with-traces   enable or disable stack trace capturing"
+  echo "  --frames        maximum number of stack frames to capture"
+  echo ""
+}
+
+while [ "$1" != "" ]; do
+  PARAM=`echo $1 | awk -F= '{print $1}'`
+  VALUE=`echo $1 | awk -F= '{print $2}'`
+
+  case $PARAM in
+    -h | --help)
+      usage
+      exit
+      ;;
+    --frames)
+      LOUSE_FRAMES="$VALUE"
+      ;;
+    --suppress)
+      LOUSE_FILTER="$VALUE"
+      ;;
+    --with-leaks)
+      LOUSE_WITHLEAKS="$VALUE"
+      ;;
+    --with-traces)
+      LOUSE_WITHTRACES="$VALUE"
+      ;;
+    *)
+      if [[ "$PARAM" == -* ]]; then
+        echo "invalid option $PARAM"
+
+        usage
+        exit 1
+      fi
+      break
+      ;;
+  esac
+  shift
+done
+
+LOUSE_FRAMES="$LOUSE_FRAMES" \
+LOUSE_FILTER="$LOUSE_FILTER" \
+LOUSE_WITHLEAKS="$LOUSE_WITHLEAKS" \
+LOUSE_WITHTRACES="$LOUSE_WITHTRACES" \
+LD_PRELOAD=liblouse.so \
+exec "$@" 
