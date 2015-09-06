@@ -12,7 +12,9 @@ existing executables and does not require recompiling or relinking
 them. However, it will only produce meaningful output (stacktraces)
 if the executable is compiled with debug symbols. For reporting
 memory leaks, louse also requires the executable to terminate
-regulary and call the regular exit handlers on shutdown.
+regularly and call the regular exit handlers on shutdown. Some 
+executables cannot be monitored with louse. It may fail for executables
+that fork and execute other programs.  
 
 Due its very limited scope, louse is often much faster than Valgrind.
 
@@ -168,6 +170,7 @@ louse provides the following options:
   to suppress certain known leaks in libraries or otherwise unfixable
   leaks.
 
+Note: all command-line options must set as `--name=value` and not `--name value`.
 
 ### Finding memory allocation and deallocation errors
 
@@ -427,6 +430,8 @@ few:
 
 * louse will only work on Linux. It is unknown if it works on other
   platforms than Ubuntu.
+* louse won't work with arbitrary executables. It may fail for executables
+  that fork and execute other programs.
 * For meaningful stack traces, it is required to compile the monitored
   executable with debug symbols. Otherwise the stack traces will only
   contain lots of `??:?`.

@@ -5,16 +5,20 @@ if [ ! -e /usr/bin/addr2line ]; then
   exit 1
 fi
 
+LOUSE_MAXFRAMES="16"
 LOUSE_FILTER=""
 LOUSE_WITHLEAKS="yes"
+LOUSE_WITHTRACES="yes"
+LOUSE_MAXLEAKS="100"
 
 function usage()
 {
   echo "$0 [arguments] program [program-arguments]"
   echo "  --suppress      regular expression for leak suppression"
-  echo "  --with-leaks    turn leak checking on or off"
   echo "  --with-traces   enable or disable stack trace capturing"
-  echo "  --frames        maximum number of stack frames to capture"
+  echo "  --with-leaks    turn leak checking on or off"
+  echo "  --max-leaks     maximum number of leaks to report"
+  echo "  --max-frames    maximum number of stack frames to capture"
   echo ""
 }
 
@@ -27,8 +31,8 @@ while [ "$1" != "" ]; do
       usage
       exit
       ;;
-    --frames)
-      LOUSE_FRAMES="$VALUE"
+    --max-frames)
+      LOUSE_MAXFRAMES="$VALUE"
       ;;
     --suppress)
       LOUSE_FILTER="$VALUE"
@@ -38,6 +42,9 @@ while [ "$1" != "" ]; do
       ;;
     --with-traces)
       LOUSE_WITHTRACES="$VALUE"
+      ;;
+    --max-leaks)
+      LOUSE_MAXLEAKS="$VALUE"
       ;;
     *)
       if [[ "$PARAM" == -* ]]; then
@@ -52,9 +59,10 @@ while [ "$1" != "" ]; do
   shift
 done
 
-LOUSE_FRAMES="$LOUSE_FRAMES" \
+LOUSE_MAXFRAMES="$LOUSE_MAXFRAMES" \
 LOUSE_FILTER="$LOUSE_FILTER" \
 LOUSE_WITHLEAKS="$LOUSE_WITHLEAKS" \
 LOUSE_WITHTRACES="$LOUSE_WITHTRACES" \
+LOUSE_MAXLEAKS="$LOUSE_MAXLEAKS" \
 LD_PRELOAD=liblouse.so \
 exec "$@" 
