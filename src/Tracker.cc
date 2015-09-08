@@ -551,7 +551,7 @@ void Tracker::emitLeaks (MemoryAllocation const* heap, regex_t* regex) {
 
       Printer::EmitError(OutFile,
                          "check", 
-                         "leak of size %llu byte(s), allocated with via %s:",
+                         "leak of size %llu byte(s), allocated via %s:",
                          static_cast<unsigned long long>(allocation->size),
                          MemoryAllocation::AccessTypeName(allocation->type));
 
