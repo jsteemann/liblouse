@@ -25,8 +25,6 @@ static debugging::Tracker Tracker;
 ////////////////////////////////////////////////////////////////////////////////
 
 __attribute__((constructor)) void InitLibrary () { 
-  // read the configuration from the environment
-  Tracker.Config.fromEnvironment();
 }
 
 // -----------------------------------------------------------------------------

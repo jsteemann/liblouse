@@ -159,6 +159,9 @@ void Tracker::Initialize () {
     Library_Exit   = _exit;
 
     State = STATE_HOOKED;
+
+    // read the configuration from the environment
+    Config.fromEnvironment();
   }
 }
 
