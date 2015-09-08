@@ -1,6 +1,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <new>
 
 #include "Tracker.h"
@@ -260,5 +261,53 @@ int posix_memalign (void** /*memptr*/, size_t /*alignment*/, size_t /*size*/) {
 void* aligned_alloc (size_t /*alignment*/, size_t /*size*/) {
   debugging::Tracker::ImmediateAbort("assertion", "aligned_alloc() is not handled");
   return nullptr;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief exit()
+////////////////////////////////////////////////////////////////////////////////
+
+void exit (int status) {
+  if (debugging::Tracker::State == debugging::Tracker::STATE_UNINITIALIZED) {
+    debugging::Tracker::Initialize();
+  }
+
+  if (debugging::Tracker::State == debugging::Tracker::STATE_TRACING) {
+    Tracker.finalize();
+  }
+
+  debugging::Tracker::Exit(status, false);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief _exit()
+////////////////////////////////////////////////////////////////////////////////
+
+void _exit (int status) {
+  if (debugging::Tracker::State == debugging::Tracker::STATE_UNINITIALIZED) {
+    debugging::Tracker::Initialize();
+  }
+
+  if (debugging::Tracker::State == debugging::Tracker::STATE_TRACING) {
+    Tracker.finalize();
+  }
+
+  debugging::Tracker::Exit(status, true);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief _Exit()
+////////////////////////////////////////////////////////////////////////////////
+
+void _Exit (int status) {
+  if (debugging::Tracker::State == debugging::Tracker::STATE_UNINITIALIZED) {
+    debugging::Tracker::Initialize();
+  }
+
+  if (debugging::Tracker::State == debugging::Tracker::STATE_TRACING) {
+    Tracker.finalize();
+  }
+
+  debugging::Tracker::Exit(status, true);
 }
 

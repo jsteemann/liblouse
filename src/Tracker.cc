@@ -1,25 +1,41 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <execinfo.h>
-#include <cxxabi.h>
-#include <sys/wait.h>
-
-#define UNW_LOCAL_ONLY
-#include <libunwind.h>
+#include <fcntl.h>
 
 #include "Tracker.h"
-#include "MemoryAllocation.h"
+#include "StackResolver.h"
+#include "Printer.h"
 
-using Configuration = debugging::Configuration;
-using Tracker = debugging::Tracker;
-using MemoryAllocation = debugging::MemoryAllocation;
+using Configuration     = debugging::Configuration;
+using MemoryAllocation  = debugging::MemoryAllocation;
+using Printer           = debugging::Printer;
+using StackResolver     = debugging::StackResolver;
+using Tracker           = debugging::Tracker;
 
 // -----------------------------------------------------------------------------
 // --SECTION--                                          private helper functions
 // -----------------------------------------------------------------------------
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief hashes a string value
+////////////////////////////////////////////////////////////////////////////////
+
+static uint64_t HashString (char const* buffer) {
+  static uint64_t const MagicPrime = 0x00000100000001b3ULL;
+  uint64_t hash = 0xcbf29ce484222325ULL;
+  uint8_t const* p = (uint8_t const*) buffer;
+
+  while (*p) {
+    hash ^= *p++;
+    hash *= MagicPrime;
+  }
+
+  return hash;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 /// @brief startup replacement for malloc()
@@ -46,46 +62,6 @@ static void* NullRealloc (void*, size_t) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-/// @brief converts a uint64_t to a base16 string representation
-////////////////////////////////////////////////////////////////////////////////
-      
-static char* NumberToAscii (uint64_t val, char* memory) {
-  char* res = memory;
-
-  if (val == 0) {
-    res[0] = '0';
-    res[1] = '\0';
-
-    return res;
-  }
-
-  int const MaxLength = 32;
-  res[MaxLength - 1] = '\0';
-
-  int i;
-  for (i = MaxLength - 2; val != 0 && i != 0; i--, val /= 16) {
-    res[i] = "0123456789ABCDEF"[val % 16];
-  }
-
-  return &res[i + 1];
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief converts a pointer to a hexadecimal string representation
-////////////////////////////////////////////////////////////////////////////////
-
-static char* PointerToAscii (void const* val, char* memory) {
-  char* buf = NumberToAscii(reinterpret_cast<uint64_t>(val), memory + 32);
-
-  // output format is 0x....
-  ::memcpy(memory + 2, buf, ::strlen(buf)); 
-  memory[0] = '0';
-  memory[1] = 'x';
-
-  return memory;
-}
-
-////////////////////////////////////////////////////////////////////////////////
 /// @brief gets a pointer to a library function
 ////////////////////////////////////////////////////////////////////////////////
       
@@ -107,10 +83,7 @@ template<typename T> static T GetLibraryFunction (char const* name) {
 ////////////////////////////////////////////////////////////////////////////////
 
 Tracker::Tracker ()
-  : allocations(), directoryLength(0) {
-
-  determineProgname();
-  determineDirectory();
+  : heap_() {
 
   Initialize();
   State = STATE_TRACING;
@@ -122,23 +95,7 @@ Tracker::Tracker ()
 ////////////////////////////////////////////////////////////////////////////////
 
 Tracker::~Tracker () {
-  auto heap = allocations.begin();
-
-  if (Config.suppressFilter != nullptr) {
-    if (::regcomp(&leakRegex, Config.suppressFilter, REG_NOSUB | REG_EXTENDED) != 0) {
-      Config.suppressFilter = nullptr;
-    }
-  }
-
-  try {
-    emitResults(heap);
-  }
-  catch (...) {
-  }
-
-  if (Config.suppressFilter != nullptr) {
-    ::regfree(&leakRegex); 
-  }
+  finalize();
 }
 
 // -----------------------------------------------------------------------------
@@ -182,12 +139,41 @@ void Tracker::Initialize () {
       ImmediateAbort("init", "cannot find free()");
     }
 
+    auto exit = GetLibraryFunction<ExitFuncType>("exit");
+
+    if (exit == nullptr) {
+      ImmediateAbort("init", "cannot find exit()");
+    }
+    
+    auto _exit = GetLibraryFunction<ExitFuncType>("_exit");
+
+    if (_exit == nullptr) {
+      ImmediateAbort("init", "cannot find _exit()");
+    }
+
     LibraryMalloc  = malloc;
     LibraryCalloc  = calloc;
     LibraryRealloc = realloc;
     LibraryFree    = free;
+    LibraryExit    = exit;
+    Library_Exit   = _exit;
 
     State = STATE_HOOKED;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief terminate the execution
+////////////////////////////////////////////////////////////////////////////////
+
+void Tracker::Exit (int status, bool immediately) {
+  if (immediately) {
+    Library_Exit(status);
+    // if LibraryExit() does not work, we must abort anyway
+    std::abort();
+  }
+  else {
+    LibraryExit(status);
   }
 }
 
@@ -196,7 +182,7 @@ void Tracker::Initialize () {
 ////////////////////////////////////////////////////////////////////////////////
 
 void Tracker::ImmediateAbort (char const* type, char const* message) {
-  EmitError(type, "%s", message);
+  Printer::EmitError(OutFile, type, "%s", message);
   std::abort();
 }
 
@@ -264,10 +250,10 @@ void* Tracker::allocateMemory (size_t size, MemoryAllocation::AccessType type) {
   allocation->init(size, type);
 
   if (Config.withTraces) { 
-    allocation->stack = captureStackTrace();
+    allocation->stack = StackResolver::captureStackTrace(Config.maxFrames);
   }
 
-  allocations.add(allocation);
+  heap_.add(allocation);
 
   // ::fprintf(stderr, "allocate returning wrapped pointer %p, orig: %p\n", allocation->memory(), pointer);
   return allocation->memory();
@@ -301,60 +287,66 @@ void Tracker::freeMemory (void* pointer, MemoryAllocation::AccessType type) {
   auto allocation = static_cast<MemoryAllocation*>(mem);
 
   if (! allocation->isOwnSignatureValid()) {
-    EmitError("runtime",
-              "%s called with invalid memory pointer %p", 
-              MemoryAllocation::AccessTypeName(type),
-              pointer);
+    Printer::EmitError(OutFile,
+                       "runtime",
+                       "%s called with invalid memory pointer %p", 
+                       MemoryAllocation::AccessTypeName(type),
+                       pointer);
 
     emitStackTrace();
   }
   else {
     if (type != MemoryAllocation::MatchingFreeType(allocation->type)) {
-      EmitError("runtime",
-                "trying to %s memory pointer %p that was originally allocated via %s",
-                MemoryAllocation::AccessTypeName(type),
-                pointer,
-                MemoryAllocation::AccessTypeName(allocation->type));
+      Printer::EmitError(OutFile,
+                         "runtime",
+                         "trying to %s memory pointer %p that was originally allocated via %s",
+                         MemoryAllocation::AccessTypeName(type),
+                         pointer,
+                         MemoryAllocation::AccessTypeName(allocation->type));
 
       emitStackTrace();
 
       if (allocation->stack != nullptr) {
-        EmitLine("");
-        EmitLine("original allocation site of memory pointer %p via %s:",
-                 pointer,
-                 MemoryAllocation::AccessTypeName(allocation->type));
+        Printer::EmitLine(OutFile, "");
+        Printer::EmitLine(OutFile,
+                          "original allocation site of memory pointer %p via %s:",
+                          pointer,
+                          MemoryAllocation::AccessTypeName(allocation->type));
 
         emitStackTrace(allocation->stack);
       }
     }
 
     if (! allocation->isTailSignatureValid()) {
-      EmitError("runtime",
-                "buffer overrun after memory pointer %p of size %llu that was originally allocated via %s",
-                pointer,
-                (unsigned long long) allocation->size,
-                MemoryAllocation::AccessTypeName(allocation->type));
+      Printer::EmitError(OutFile,
+                         "runtime",
+                         "buffer overrun after memory pointer %p of size %llu that was originally allocated via %s",
+                         pointer,
+                         static_cast<unsigned long long>(allocation->size),
+                         MemoryAllocation::AccessTypeName(allocation->type));
 
       emitStackTrace();
 
       if (allocation->stack != nullptr) {
-        EmitLine("");
-        EmitLine("original allocation site of memory pointer %p via %s:",
-                 pointer,
-                 MemoryAllocation::AccessTypeName(allocation->type));
+        Printer::EmitLine(OutFile, "");
+        Printer::EmitLine(OutFile,
+                          "original allocation site of memory pointer %p via %s:",
+                          pointer,
+                          MemoryAllocation::AccessTypeName(allocation->type));
 
         emitStackTrace(allocation->stack);
       }
     }
   }
 
-  allocations.remove(allocation);
+  heap_.remove(allocation);
 
   allocation->wipeSignature();
 
   if (allocation->stack != nullptr) {
     LibraryFree(allocation->stack);
   }
+
   LibraryFree(mem);
 }
 
@@ -382,6 +374,38 @@ size_t Tracker::memorySize (void* pointer) const {
   return 0;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+/// @brief finalize the tracker, show results
+////////////////////////////////////////////////////////////////////////////////
+
+void Tracker::finalize () {
+  if (Finalized) {
+    return;
+  }
+
+  Finalized = true;
+ 
+  regex_t re;
+
+  if (Config.suppressFilter != nullptr &&
+      *Config.suppressFilter != '\0') {
+    if (::regcomp(&re, Config.suppressFilter, REG_NOSUB | REG_EXTENDED) != 0) {
+      Config.suppressFilter = nullptr;
+    }
+  }
+
+  try {
+    emitResults(&re);
+  }
+  catch (...) {
+  }
+
+  if (Config.suppressFilter != nullptr && 
+      *Config.suppressFilter != '\0') {
+    ::regfree(&re);
+  }
+}
+
 // -----------------------------------------------------------------------------
 // --SECTION--                                                   private methods
 // -----------------------------------------------------------------------------
@@ -390,14 +414,14 @@ size_t Tracker::memorySize (void* pointer) const {
 /// @brief whether or not a leak should be suppressed
 ////////////////////////////////////////////////////////////////////////////////
 
-bool Tracker::mustSuppressLeak (char const* text) {
+bool Tracker::mustSuppressLeak (char const* stack, regex_t* regex) {
   if (Config.suppressFilter == nullptr || 
       *Config.suppressFilter == '\0' ||
-      text == nullptr) {
+      stack == nullptr) {
     return false;
   }
 
-  if (::regexec(&leakRegex, text, 0, nullptr, 0) != 0) {
+  if (::regexec(regex, stack, 0, nullptr, 0) != 0) {
     return false;
   }
 
@@ -409,15 +433,13 @@ bool Tracker::mustSuppressLeak (char const* text) {
 ////////////////////////////////////////////////////////////////////////////////
 
 void Tracker::emitStackTrace () {
-  void** stack = captureStackTrace();
+  void* stack[64];
 
-  if (stack == nullptr) {
+  if (! StackResolver::captureStackTrace(Config.maxFrames, &stack[0], sizeof(stack) / sizeof(stack[0]))) {
     return;
   }
 
-  emitStackTrace(stack);
-
-  LibraryFree(stack); 
+  emitStackTrace(&stack[0]);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -429,13 +451,18 @@ void Tracker::emitStackTrace (void** stack) {
     return;
   }
 
-  std::unordered_map<void*, char*> cache;
+  StackResolver resolver;
+
   char memory[4096];
 
-  char* buffer = resolveStack(cache, &memory[0], sizeof(memory), stack);
+  char* buffer = resolver.resolveStack(Config.maxFrames, 
+                                       Printer::UseColors(OutFile), 
+                                       &memory[0], 
+                                       sizeof(memory), 
+                                       stack);
 
   if (buffer != nullptr) {
-    EmitLine("%s", buffer);
+    Printer::EmitLine(OutFile, "%s", buffer);
   }
 }
 
@@ -444,61 +471,99 @@ void Tracker::emitStackTrace (void** stack) {
 /// starting with the argument
 ////////////////////////////////////////////////////////////////////////////////
 
-void Tracker::emitResults (MemoryAllocation const* heap) {
-  EmitLine("");
-  EmitLine("RESULTS --------------------------------------------------------");
-  EmitLine("");
+void Tracker::emitResults (regex_t* regex) {
+  // rebind to tty if printing to OutFile is not possible 
+  if (::fprintf(OutFile, "%s", "") < 0) {
+    OutFile = ::fopen("/dev/tty", "w");
+  }
 
-  auto stats = allocations.totals();
+  Printer::EmitLine(OutFile, "");
+  Printer::EmitLine(OutFile, "RESULTS --------------------------------------------------------");
+  Printer::EmitLine(OutFile, "");
 
-  EmitLine("# total number of allocations: %llu",
-           (unsigned long long) stats.first);
+  auto begin = heap_.begin(); // save current head of heap!
+  auto stats = heap_.totals();
 
-  EmitLine("# total size of allocations: %llu",
-           (unsigned long long) stats.second);
+  Printer::EmitLine(OutFile,
+                    "# total number of allocations: %llu",
+                    static_cast<unsigned long long>(stats.first));
 
-  if (allocations.isCorrupted(heap)) {
-    EmitError("check", 
-              "heap is corrupted - leak checking is not possible");
+  Printer::EmitLine(OutFile,
+                    "# total size of allocations: %llu",
+                    static_cast<unsigned long long>(stats.second));
+
+  if (heap_.isCorrupted(begin)) {
+    Printer::EmitError(OutFile,
+                       "check", 
+                       "heap is corrupted - leak checking is not possible");
     return;
   }
 
   if (Config.withLeaks) {
-    emitLeaks(heap);
+    emitLeaks(begin, regex);
   }
 
-  EmitLine("");
+  Printer::EmitLine(OutFile, "");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 /// @brief print all leaks for the memory blocks, starting with the argument
 ////////////////////////////////////////////////////////////////////////////////
 
-void Tracker::emitLeaks (MemoryAllocation const* heap) { 
-  std::unordered_map<void*, char*> cache;
+void Tracker::emitLeaks (MemoryAllocation const* heap, regex_t* regex) { 
   char memory[16384];
 
-  int shown = 0;
-  uint64_t numLeaks = 0;
-  uint64_t sizeLeaks = 0;
+  int shown              = 0;
+  uint64_t numLeaks      = 0;
+  uint64_t numDuplicates = 0;
+  uint64_t sizeLeaks     = 0;
   auto allocation = heap;
 
+  std::unordered_set<uint64_t> seen;
+  StackResolver resolver;
+
   while (allocation != nullptr) {
-    char* stack = resolveStack(cache, &memory[0], sizeof(memory), allocation->stack);
+    char* stack = resolver.resolveStack(Config.maxFrames, 
+                                        Printer::UseColors(OutFile), 
+                                        &memory[0], 
+                                        sizeof(memory), 
+                                        allocation->stack);
 
-    if (! mustSuppressLeak(stack)) {
-      EmitError("check", 
-                "leak of size %llu byte(s), allocated with via %s:",
-                (unsigned long long) allocation->size,
-                MemoryAllocation::AccessTypeName(allocation->type));
+    if (! mustSuppressLeak(stack, regex)) {
 
-      EmitLine("%s", 
-               (stack ? stack : "  # no stack available"));
+      if (stack != nullptr) {
+        uint64_t hash = HashString(stack);
+
+        if (seen.find(hash) != seen.end()) {
+          // duplicate
+          ++numDuplicates;
+          sizeLeaks += allocation->size;
+
+          allocation = allocation->next;
+          continue;
+        }
+
+        seen.emplace(hash);
+      }
+
+      Printer::EmitError(OutFile,
+                         "check", 
+                         "leak of size %llu byte(s), allocated with via %s:",
+                         static_cast<unsigned long long>(allocation->size),
+                         MemoryAllocation::AccessTypeName(allocation->type));
+
+      Printer::EmitLine(OutFile,
+                        "%s", 
+                        (stack ? stack : "  # no stack available"));
     
       ++numLeaks;
       sizeLeaks += allocation->size;
 
       if (++shown >= Config.maxLeaks) {
+        Printer::EmitError(OutFile,   
+                           "check",
+                           "stopping output at %d unique leak(s), results are incomplete",
+                           shown); 
         break;
       }
     }
@@ -506,322 +571,17 @@ void Tracker::emitLeaks (MemoryAllocation const* heap) {
     allocation = allocation->next;
   } 
 
-  for (auto& it : cache) {
-    LibraryFree(it.second);
-  }
-
   if (sizeLeaks == 0) {
-    EmitLine("# no leaks found");
+    Printer::EmitLine(OutFile, "# no leaks found");
   }
   else {
-    EmitError("check", 
-              "found %llu leaks(s) with total size of %llu byte(s)",
-              (unsigned long long) numLeaks,
-              (unsigned long long) sizeLeaks);
+    Printer::EmitError(OutFile,
+                       "check", 
+                       "found %llu unique leaks(s), %llu duplicates, with total size of %llu byte(s)",
+                       static_cast<unsigned long long>(numLeaks),
+                       static_cast<unsigned long long>(numDuplicates),
+                       static_cast<unsigned long long>(sizeLeaks));
   }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief emits a line
-////////////////////////////////////////////////////////////////////////////////
-
-void Tracker::EmitLine (char const* format, ...) { 
-  char buffer[2048];
-
-  va_list ap;
-  va_start(ap, format);
-  int length = ::vsnprintf(buffer, sizeof(buffer) - 1, format, ap);
-  va_end(ap);
-
-  buffer[sizeof(buffer) - 1] = '\0'; // paranoia
-
-  if (length >= 0) {
-    ::fprintf(OutFile, "%s\n", &buffer[0]);
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief emits an error
-////////////////////////////////////////////////////////////////////////////////
-
-void Tracker::EmitError (char const* type, char const* format, ...) { 
-  char buffer[2048];
-
-  va_list ap;
-  va_start(ap, format);
-  int length = ::vsnprintf(buffer, sizeof(buffer) - 1, format, ap);
-  va_end(ap);
-
-  buffer[sizeof(buffer) - 1] = '\0'; // paranoia
-
-  if (length > 0) {
-    if (::isatty(::fileno(OutFile))) {
-      ::fprintf(OutFile, "\n\033[31;1m%s error: %s\033[0m\n", type, &buffer[0]);
-    }
-    else {
-      ::fprintf(OutFile, "\n%s error: %s\n", type, &buffer[0]);
-    }
-    ::fflush(OutFile);
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief captures a stacktrace
-////////////////////////////////////////////////////////////////////////////////
-
-void** Tracker::captureStackTrace () {
-  char memory[256];
-
-  void** trace = reinterpret_cast<void**>(memory);
-
-  int frames = Config.maxFrames + 2;
-
-  while (frames * sizeof(void*) > sizeof(memory)) {
-    --frames;
-  }
-
-  int traceSize = 0;
-  unw_cursor_t cursor; 
-  unw_context_t uc;
-  unw_word_t ip;
-
-  unw_getcontext(&uc);
-  unw_init_local(&cursor, &uc);
-
-  while (traceSize < frames && unw_step(&cursor) > 0) {
-    unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    trace[traceSize++] = (void*) ip;
-  }
-
-  if (traceSize < 2) {
-    return nullptr;
-  }
-
-  void** pcs = static_cast<void**>(LibraryMalloc(sizeof(void*) * traceSize));
-
-  if (pcs == nullptr) {
-    return nullptr;
-  }
-
-  ::memcpy(&pcs[0], trace + 1, sizeof(void*) * (traceSize - 1));
-  pcs[traceSize - 1] = nullptr;
-
-  return pcs;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief converts a stacktrace into human-readable text
-////////////////////////////////////////////////////////////////////////////////
-
-char* Tracker::resolveStack (std::unordered_map<void*, char*>& cache, char* memory, size_t length, void** stack) {
-  if (stack == nullptr) {
-    return nullptr;
-  }
-
-  char* start = memory;
-  int frames = 0;
-
-  while (*stack != nullptr) {
-    if (frames++ >= Config.maxFrames) {
-      break;
-    }
-
-    void* pc = *stack;
-
-    auto it = cache.find(pc);
-
-    if (it != cache.end()) {
-      size_t len = ::strlen((*it).second);
-      ::memcpy(memory, (*it).second, len);
-      memory += len;
-    } 
-    else {
-      Dl_info dlinf;
-      char* line;
-      if (::dladdr(pc, &dlinf) == 0 || 
-          dlinf.dli_fname[0] != '/' || 
-          ! ::strcmp(progname(), dlinf.dli_fname)) {
-        line = addr2line(progname(), pc, &memory);
-      } 
-      else {
-        line = addr2line(dlinf.dli_fname, reinterpret_cast<void*>(reinterpret_cast<char*>(pc) - reinterpret_cast<char*>(dlinf.dli_fbase)), &memory);
-      }
-
-      if (line == nullptr) {
-        return nullptr;
-      }
-
-      size_t len = ::strlen(line); 
-      char* copy = static_cast<char*>(LibraryMalloc(len + 1));
-
-      if (copy != nullptr) {
-        ::memcpy(copy, line, len);
-        copy[len] = '\0';
-
-        try {
-          cache.emplace(pc, static_cast<char*>(copy));
-        }
-        catch (...) {
-          LibraryFree(copy);
-        }
-      }
-    }
-
-    *memory = '\0';
-
-    if (static_cast<size_t>(memory - start) + 1024 >= length) {
-      // we're about to run out of memory
-      break;
-    }
-
-    ++stack;
-  } 
-
-  *memory = '\0';
-
-  if (frames > 0 && memory > start) {
-    --memory;
-    *memory = '\0';
-  }
-
-  return start;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief calls addr2line 
-////////////////////////////////////////////////////////////////////////////////
-
-char* Tracker::addr2line (char const* prog, void* pc, char** memory) {
-  int pipefd[2];
-
-  if (::pipe(pipefd) != 0) {
-    return nullptr;
-  }
-
-  pid_t pid = ::fork();
-
-  if (pid == 0) {
-    ::close(pipefd[0]);
-    ::dup2(pipefd[1], STDOUT_FILENO);
-    ::dup2(pipefd[1], STDERR_FILENO);
-
-    // do not pass LD_PRELOAD to sub-shell    
-    char const* env[] = { "LD_PRELOAD=", nullptr };
-
-    if (::execle("/usr/bin/addr2line", "addr2line", PointerToAscii(pc, *memory), "-C", "-f", "-e", prog, nullptr, env) == -1) {
-      ::close(pipefd[1]);
-      EmitError("internal",
-                "unable to invoke /usr/bin/addr2line");
-      std::exit(1);
-    }
-  }
-
-  ::close(pipefd[1]);
-
-  char lineBuffer[1024];
-  ssize_t len = ::read(pipefd[0], &lineBuffer[0], sizeof(lineBuffer) - 1);
-  ::close(pipefd[0]);
-
-  if (len == 0) {
-    return nullptr;
-  }
-
-  lineBuffer[len] = '\0';
-
-  if (::waitpid(pid, nullptr, 0) != pid) {
-    return nullptr;
-  }
-
-  char* p = &lineBuffer[0];
-  char* nl = ::strchr(p, '\n');
-          
-  if (::strstr(p, "debugging::Tracker::") != nullptr) {
-    return *memory;
-  }
-  
-  char* old = *memory;
-  char const* a = "  # ";
-  ::memcpy(*memory, a, ::strlen(a));
-  *memory += ::strlen(a);
-
-  if (nl != nullptr) {
-    // function name
-    ::memcpy(*memory, p, nl - p);
-    *memory += nl - p;
-
-    char const* a;
-    if (::isatty(::fileno(OutFile))) {
-      a = " (\033[33m";
-    }
-    else {
-      a = " (";
-    }
-    ::memcpy(*memory, a, ::strlen(a));
-    *memory += ::strlen(a);
-
-    // filename
-    size_t l = ::strlen(nl + 1);
-    if (l > 1 && nl[l] == '\n') {
-      --l;
-    }
-
-    if (directoryLength < l &&
-        strncmp(nl + 1, directoryBuffer, directoryLength) == 0) {
-      // strip pwd
-      nl += directoryLength;
-      l -= directoryLength;
-    }
-
-    ::memcpy(*memory, nl + 1, l);
-    *memory += l;
-
-    char const* b;
-    if (::isatty(::fileno(OutFile))) {
-      b = "\033[0m)\n";
-    } 
-    else {
-      b = ")\n";
-    }
-    ::memcpy(*memory, b, ::strlen(b));
-    *memory += ::strlen(b);
-  } 
-  else {
-    ::memcpy(*memory, p, len);
-    *memory += len;
-  }
-
-  **memory = '\0';
-
-  return old;
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief determines the name of the executable
-////////////////////////////////////////////////////////////////////////////////
-
-void Tracker::determineProgname () {
-  ssize_t length = ::readlink("/proc/self/exe", &prognameBuffer[0], sizeof(prognameBuffer) - 1);
-
-  if (length < 0) {
-    length = 0;
-  }
-  prognameBuffer[length] = '\0';
-}
-
-////////////////////////////////////////////////////////////////////////////////
-/// @brief determines the current directory
-////////////////////////////////////////////////////////////////////////////////
-
-void Tracker::determineDirectory () {
-  size_t length = 0;
-
-  if (::getcwd(&directoryBuffer[0], sizeof(directoryBuffer) - 2) != nullptr) {
-    length = ::strlen(directoryBuffer);
-  }
-  directoryBuffer[length] = '/';
-  directoryBuffer[length + 1] = '\0';
-
-  directoryLength = length + 1;
 }
 
 // -----------------------------------------------------------------------------
@@ -853,6 +613,18 @@ Tracker::ReallocFuncType Tracker::LibraryRealloc          = nullptr;
 Tracker::FreeFuncType    Tracker::LibraryFree             = nullptr;
 
 ////////////////////////////////////////////////////////////////////////////////
+/// @brief library exit() function
+////////////////////////////////////////////////////////////////////////////////
+
+Tracker::ExitFuncType    Tracker::LibraryExit             = nullptr;
+
+////////////////////////////////////////////////////////////////////////////////
+/// @brief library _exit() function
+////////////////////////////////////////////////////////////////////////////////
+
+Tracker::ExitFuncType    Tracker::Library_Exit            = nullptr;
+
+////////////////////////////////////////////////////////////////////////////////
 /// @brief tracker state
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -871,6 +643,12 @@ FILE*                    Tracker::OutFile                 = stderr;
 Configuration            Tracker::Config;
 
 ////////////////////////////////////////////////////////////////////////////////
+/// @brief whether or not finalization was run
+////////////////////////////////////////////////////////////////////////////////
+
+bool                     Tracker::Finalized               = false;
+
+////////////////////////////////////////////////////////////////////////////////
 /// @brief buffer for untracked pointers
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -881,5 +659,4 @@ void*                    Tracker::UntrackedPointers[4096];
 ////////////////////////////////////////////////////////////////////////////////
 
 size_t                   Tracker::UntrackedPointersLength = 0;
-
 

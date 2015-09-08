@@ -1,7 +1,7 @@
 
 .PHONY: out-directory install clean
 
-OBJ = src/MemoryAllocation.o src/Configuration.o src/Heap.o src/Tracker.o src/liblouse.o
+OBJ = src/MemoryAllocation.o src/Configuration.o src/Heap.o src/Printer.o src/StackResolver.o src/Tracker.o src/liblouse.o
 
 all: build
 
