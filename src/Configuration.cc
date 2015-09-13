@@ -19,8 +19,7 @@ using Configuration = debugging::Configuration;
 /// @brief create the configuration with defaults
 ////////////////////////////////////////////////////////////////////////////////
 
-Configuration::Configuration ()
-  : suppressFilter(nullptr), withLeaks(true), withTraces(true), maxFrames(16), maxLeaks(100) {
+Configuration::Configuration () {
 } 
 
 // -----------------------------------------------------------------------------
@@ -32,6 +31,13 @@ Configuration::Configuration ()
 ////////////////////////////////////////////////////////////////////////////////
 
 void Configuration::fromEnvironment () {
+  // set some defaults
+  suppressFilter = nullptr;
+  withLeaks      = true;
+  withTraces     = true;
+  maxFrames      = 16;
+  maxLeaks       = 100;
+
   char const* value;
 
   value = ::getenv("LOUSE_WITHLEAKS");
@@ -74,14 +80,14 @@ void Configuration::fromEnvironment () {
 ////////////////////////////////////////////////////////////////////////////////
 
 bool Configuration::toBoolean (char const* value, bool defaultValue) const {
-  if (::strcmp(value, "on") ==  0 || 
+  if (::strcmp(value, "on") == 0 || 
       ::strcmp(value, "1") == 0 || 
       ::strcmp(value, "true") == 0 || 
       ::strcmp(value, "yes") == 0) {
     return true;
   }
 
-  if (::strcmp(value, "off") ==  0 || 
+  if (::strcmp(value, "off") == 0 || 
       ::strcmp(value, "0") == 0 || 
       ::strcmp(value, "false") == 0 || 
       ::strcmp(value, "no") == 0) {
