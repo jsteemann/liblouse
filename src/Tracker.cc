@@ -17,6 +17,14 @@ using StackResolver     = debugging::StackResolver;
 using Tracker           = debugging::Tracker;
 
 // -----------------------------------------------------------------------------
+// --SECTION--                                                 private variables
+// -----------------------------------------------------------------------------
+    
+static char* CallocBuffer[1024];
+
+static size_t CallocPosition = 0;
+
+// -----------------------------------------------------------------------------
 // --SECTION--                                          private helper functions
 // -----------------------------------------------------------------------------
 
@@ -49,8 +57,23 @@ static void* NullMalloc (size_t) {
 /// @brief startup replacement for calloc()
 ////////////////////////////////////////////////////////////////////////////////
 
-static void* NullCalloc (size_t, size_t) {
-  return nullptr;
+static void* NullCalloc (size_t nmemb, size_t size) {
+  if (CallocPosition == 0) {
+    // first call. now init buffer
+    ::memset(CallocBuffer, 0, sizeof(CallocBuffer));
+  }
+
+  size_t const totalSize = nmemb * size;
+
+  if (CallocPosition + totalSize >= sizeof(CallocBuffer)) {
+    // not enough memory
+    return nullptr;
+  }
+
+  void* memory = static_cast<void*>(&CallocBuffer[0] + CallocPosition);
+  CallocPosition += totalSize;
+
+  return memory;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -162,6 +185,12 @@ void Tracker::Initialize () {
 
     // read the configuration from the environment
     Config.fromEnvironment();
+
+    // remove preloader from environment for all sub-processes
+    ::unsetenv("LD_PRELOAD");
+
+    ::atexit([] () {
+    });
   }
 }
 
@@ -171,11 +200,13 @@ void Tracker::Initialize () {
 
 void Tracker::Exit (int status, bool immediately) {
   if (immediately) {
+    // _exit()
     Library_Exit(status);
     // if LibraryExit() does not work, we must abort anyway
     std::abort();
   }
   else {
+    // exit()
     LibraryExit(status);
   }
 }

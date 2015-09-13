@@ -280,7 +280,7 @@ char* StackResolver::addr2line (bool useColors, char const* prog, void* pc, char
     ::dup2(pipefd[1], STDERR_FILENO);
 
     // do not pass LD_PRELOAD to sub-shell    
-    char const* env[] = { "LD_PRELOAD=", nullptr };
+    char const* env[] = { nullptr };
 
     if (::execle("/usr/bin/addr2line", "addr2line", PointerToAscii(pc, *memory), "-C", "-f", "-e", prog, nullptr, env) == -1) {
       ::close(pipefd[1]);
